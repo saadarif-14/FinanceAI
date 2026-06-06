@@ -22,24 +22,19 @@ export function AuthProvider({ children }) {
   const login = async (email, password) => {
     const data = await api.login(email, password);
     localStorage.setItem("fa_token", data.token);
-    setUser(data.user);
-    return data.user;
-  };
-
-  const register = async (email, password) => {
-    const data = await api.register(email, password);
-    localStorage.setItem("fa_token", data.token);
+    if (data.refresh_token) localStorage.setItem("fa_refresh_token", data.refresh_token);
     setUser(data.user);
     return data.user;
   };
 
   const logout = () => {
     localStorage.removeItem("fa_token");
+    localStorage.removeItem("fa_refresh_token");
     setUser(null);
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, register, logout, loading }}>
+    <AuthContext.Provider value={{ user, login, logout, loading }}>
       {children}
     </AuthContext.Provider>
   );

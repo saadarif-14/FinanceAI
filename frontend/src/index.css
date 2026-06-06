@@ -5,19 +5,38 @@
 }
 
 body {
-  background-color: #0f172a;
+  background-color: #07071a;
   color: #f1f5f9;
 }
 
 /* Scrollbar */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #1e293b; }
-::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #64748b; }
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.3); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.6); }
+
+/* Glass card base */
+.glass {
+  background: rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+/* Glow animation for ambient blobs */
+@keyframes blob-drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%       { transform: translate(30px, -20px) scale(1.05); }
+  66%       { transform: translate(-20px, 15px) scale(0.97); }
+}
+
+.blob { animation: blob-drift 18s ease-in-out infinite; }
+.blob-2 { animation: blob-drift 24s ease-in-out infinite reverse; animation-delay: -6s; }
+.blob-3 { animation: blob-drift 20s ease-in-out infinite; animation-delay: -12s; }
 
 /* Chat bubble markdown */
 .prose-chat p { margin: 0.25rem 0; }
 .prose-chat ul { list-style: disc; padding-left: 1.25rem; margin: 0.25rem 0; }
 .prose-chat ol { list-style: decimal; padding-left: 1.25rem; margin: 0.25rem 0; }
 .prose-chat strong { font-weight: 600; color: #e2e8f0; }
-.prose-chat code { background: #1e293b; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.85em; }
+.prose-chat code { background: rgba(139,92,246,0.15); padding: 0.1rem 0.3rem; border-radius: 4px; font-size: 0.85em; }

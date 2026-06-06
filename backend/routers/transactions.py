@@ -1,38 +1,41 @@
 import io
-from datetime import date
-from typing import Optional, List
+from collections import defaultdict
+from datetime import date, datetime as dt
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
-from sqlalchemy.orm import Session
-from sqlalchemy import func
 from pydantic import BaseModel
 import pandas as pd
+from supabase import Client
 from database import get_db
-import models
 import auth_utils
 from services.analytics_service import recompute_analytics
+from limiter import cache_invalidate
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
 CATEGORY_MAP = {
-    "Groceries": ["whole foods", "safeway", "kroger", "trader joe", "costco", "walmart", "target", "aldi",
-                  "publix", "fresh market", "sprouts", "stop & shop", "giant", "meijer"],
-    "Dining": ["restaurant", "cafe", "coffee", "starbucks", "mcdonalds", "mcdonald", "chipotle", "subway",
-               "pizza", "sushi", "doordash", "uber eats", "grubhub", "postmates", "panera", "dunkin",
-               "chick-fil-a", "wendy", "burger king", "taco bell", "five guys", "shake shack"],
-    "Transportation": ["uber", "lyft", "gas station", "shell", "chevron", "bp ", "exxon", "mobil", "citgo",
-                       "parking", "metro", "transit", "amtrak", "greyhound", "enterprise", "hertz", "zipcar"],
-    "Subscriptions": ["netflix", "spotify", "hulu", "disney+", "hbo", "apple music", "amazon prime",
-                      "microsoft 365", "office 365", "adobe", "dropbox", "icloud", "google one",
-                      "gym", "fitness", "planet fitness", "la fitness", "24 hour"],
-    "Entertainment": ["movie", "cinema", "theater", "concert", "ticketmaster", "steam", "xbox", "playstation",
-                      "nintendo", "fandango", "amc ", "regal"],
-    "Healthcare": ["pharmacy", "cvs", "walgreens", "rite aid", "doctor", "dental", "clinic", "hospital",
-                   "medical", "optometrist", "urgent care", "lab corp", "quest diagnostics"],
-    "Shopping": ["amazon", "ebay", "etsy", "zara", "h&m", "nike", "apple store", "best buy", "home depot",
-                 "lowes", "ikea", "macy", "nordstrom", "gap", "old navy", "tj maxx", "marshalls"],
-    "Utilities": ["electric", "electricity", "water utility", "gas utility", "internet", "comcast", "xfinity",
-                  "at&t", "verizon", "t-mobile", "spectrum", "pg&e", "con ed", "duke energy"],
-    "Income": ["salary", "payroll", "direct deposit", "paycheck", "income", "transfer in", "refund"],
+    "Groceries": ["imtiaz", "carrefour", "metro cash", "alfatah", "naheed", "hyperstar", "chase up",
+                  "agha", "united mart", "bin hashim", "supermarket", "grocery", "departmental"],
+    "Dining": ["kfc", "mcdonald", "burger", "pizza hut", "dominos", "hardee", "subway", "bar.b.q",
+               "cafe", "restaurant", "biryani", "karahi", "bakers", "lasania", "cosa nostra",
+               "food panda", "bykea food", "cheetay", "cheezious"],
+    "Transportation": ["careem", "uber", "bykea", "indrive", "pso", "shell", "total parco", "attock",
+                       "caltex", "parking", "toll", "daewoo", "faisal movers", "bus", "rickshaw"],
+    "Subscriptions": ["netflix", "spotify", "youtube premium", "jazz", "telenor", "zong", "ufone",
+                      "ptcl", "starzplay", "tapmad", "icloud", "microsoft 365", "adobe", "dropbox",
+                      "gym", "fitness", "f45", "anytime fitness"],
+    "Entertainment": ["cinema", "nueplex", "cinepax", "atrium", "eveready", "concert", "event",
+                      "movie", "steam", "playstation", "xbox", "nintendo"],
+    "Healthcare": ["pharmacy", "medipak", "ds pharma", "alta pharmacy", "agha khan", "shifa",
+                   "liaquat", "doctor", "dental", "clinic", "hospital", "lab", "chughtai",
+                   "dr essa", "diagnostic", "medical"],
+    "Shopping": ["daraz", "naheed", "breakout", "alkaram", "gul ahmed", "khaadi", "sapphire",
+                 "bonanza", "outfitters", "limelight", "j.", "bata", "servis", "stylo",
+                 "electronics", "mobile", "laptop", "techno city"],
+    "Utilities": ["k-electric", "lesco", "iesco", "gepco", "sui gas", "ssgc", "sngpl", "ptcl",
+                  "nayatel", "stormfiber", "wi-tribe", "internet", "electricity", "gas bill", "water"],
+    "Income": ["salary", "payroll", "employer", "payment received", "income", "freelance",
+               "transfer in", "refund", "commission", "bonus", "dividend"],
 }
 
 
@@ -52,6 +55,18 @@ class TransactionCreate(BaseModel):
     description: Optional[str] = ""
 
 
+def _fmt(t: dict) -> dict:
+    return {
+        "id": t["id"],
+        "date": t["date"],
+        "amount": t["amount"],
+        "merchant": t["merchant"],
+        "category": t["category"],
+        "description": t.get("description", ""),
+        "source": t.get("source", "manual"),
+    }
+
+
 @router.get("")
 def list_transactions(
     start_date: Optional[str] = None,
@@ -59,72 +74,57 @@ def list_transactions(
     category: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    query = db.query(models.Transaction).filter(models.Transaction.user_id == current_user.id)
-    if start_date:
-        query = query.filter(models.Transaction.date >= date.fromisoformat(start_date))
-    if end_date:
-        query = query.filter(models.Transaction.date <= date.fromisoformat(end_date))
-    if category:
-        query = query.filter(models.Transaction.category == category)
+    uid = str(current_user.id)
+    query = db.table("transactions").select("*", count="exact").eq("user_id", uid)
 
-    total = query.count()
-    txns = query.order_by(models.Transaction.date.desc()).offset(offset).limit(limit).all()
+    if start_date:
+        query = query.gte("date", start_date)
+    if end_date:
+        query = query.lte("date", end_date)
+    if category:
+        query = query.eq("category", category)
+
+    result = query.order("date", desc=True).range(offset, offset + limit - 1).execute()
 
     return {
-        "total": total,
-        "transactions": [
-            {
-                "id": t.id,
-                "date": t.date.isoformat(),
-                "amount": t.amount,
-                "merchant": t.merchant,
-                "category": t.category,
-                "description": t.description,
-                "source": t.source,
-            }
-            for t in txns
-        ],
+        "total": result.count or 0,
+        "transactions": [_fmt(t) for t in result.data],
     }
 
 
 @router.post("")
 def create_transaction(
     req: TransactionCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    t = models.Transaction(
-        user_id=current_user.id,
-        date=req.date,
-        amount=req.amount,
-        merchant=req.merchant,
-        category=req.category or categorize(req.merchant, req.description or ""),
-        description=req.description or "",
-        source="manual",
-    )
-    db.add(t)
-    db.commit()
-    db.refresh(t)
-    return {"id": t.id, "date": t.date.isoformat(), "amount": t.amount, "merchant": t.merchant, "category": t.category}
+    uid = str(current_user.id)
+    record = {
+        "user_id": uid,
+        "date": req.date.isoformat(),
+        "amount": req.amount,
+        "merchant": req.merchant,
+        "category": req.category or categorize(req.merchant, req.description or ""),
+        "description": req.description or "",
+        "source": "manual",
+    }
+    result = db.table("transactions").insert(record).execute()
+    t = result.data[0]
+    cache_invalidate(f"summary:{uid}")
+    return {"id": t["id"], "date": t["date"], "amount": t["amount"], "merchant": t["merchant"], "category": t["category"]}
 
 
 @router.post("/import")
 async def import_csv(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    """
-    Import transactions from CSV. Expected columns (flexible):
-    date, amount, merchant/description, category (optional)
-
-    Handles: duplicates, missing fields, mixed date formats, junk rows.
-    """
-    if not file.filename.endswith(".csv"):
+    if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
     content = await file.read()
@@ -135,9 +135,8 @@ async def import_csv(
 
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Flexible column detection
-    date_col = next((c for c in df.columns if "date" in c), None)
-    amount_col = next((c for c in df.columns if "amount" in c or "price" in c or "cost" in c), None)
+    date_col     = next((c for c in df.columns if "date" in c), None)
+    amount_col   = next((c for c in df.columns if "amount" in c or "price" in c or "cost" in c), None)
     merchant_col = next((c for c in df.columns if any(k in c for k in ["merchant", "description", "payee", "name", "vendor"])), None)
     category_col = next((c for c in df.columns if "category" in c or "type" in c), None)
 
@@ -147,15 +146,15 @@ async def import_csv(
             detail=f"CSV must have columns for date, amount, and merchant. Found: {list(df.columns)}",
         )
 
-    imported = 0
+    uid = str(current_user.id)
+    records = []
     skipped = 0
+    duplicates = 0
     errors = []
 
     for idx, row in df.iterrows():
         try:
-            # Parse date (try multiple formats)
             raw_date = str(row[date_col]).strip()
-            from datetime import datetime as dt
             parsed_date = None
             for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%Y/%m/%d"):
                 try:
@@ -167,7 +166,7 @@ async def import_csv(
                 skipped += 1
                 continue
 
-            raw_amount = str(row[amount_col]).strip().replace(",", "").replace("$", "").replace("(", "-").replace(")", "")
+            raw_amount = str(row[amount_col]).strip().replace(",", "").replace("Rs", "").replace("(", "-").replace(")", "")
             amount = float(raw_amount)
             if amount == 0:
                 skipped += 1
@@ -178,34 +177,104 @@ async def import_csv(
                 skipped += 1
                 continue
 
-            category = str(row[category_col]).strip() if category_col and str(row.get(category_col, "")).lower() not in ("nan", "none", "") else None
-            if not category:
-                category = categorize(merchant)
+            cat_val = str(row.get(category_col, "")).strip() if category_col else ""
+            category = cat_val if cat_val and cat_val.lower() not in ("nan", "none", "") else categorize(merchant)
 
-            t = models.Transaction(
-                user_id=current_user.id,
-                date=parsed_date,
-                amount=amount,
-                merchant=merchant,
-                category=category,
-                description="",
-                source="csv",
-            )
-            db.add(t)
-            imported += 1
+            records.append({
+                "user_id": uid,
+                "date": parsed_date.isoformat(),
+                "amount": amount,
+                "merchant": merchant,
+                "category": category,
+                "description": "",
+                "source": "csv",
+            })
 
         except Exception as e:
             errors.append(f"Row {idx}: {e}")
             skipped += 1
 
-    db.commit()
+    conflicts = []
 
-    # Re-run analytics in background after import
-    background_tasks.add_task(recompute_analytics, current_user.id, db)
+    if records:
+        # Fetch existing transactions that overlap the date range of this import
+        dates = [r["date"] for r in records]
+        existing_res = (
+            db.table("transactions")
+            .select("date,amount,merchant,source")
+            .eq("user_id", uid)
+            .gte("date", min(dates))
+            .lte("date", max(dates))
+            .execute()
+        )
+        existing = existing_res.data
+
+        # Build exact-fingerprint set for duplicate detection
+        existing_fingerprints = {
+            (r["date"], r["amount"], r["merchant"].strip().lower())
+            for r in existing
+        }
+
+        unique_records = []
+        for r in records:
+            fp = (r["date"], r["amount"], r["merchant"].strip().lower())
+            if fp in existing_fingerprints:
+                duplicates += 1
+            else:
+                existing_fingerprints.add(fp)
+                unique_records.append(r)
+
+        # Conflict detection: same merchant ± date ± 15% amount but different source
+        for new_r in unique_records:
+            new_d = dt.strptime(new_r["date"], "%Y-%m-%d").date()
+            new_amt = abs(new_r["amount"])
+            new_merchant = new_r["merchant"].lower().strip()
+            for ex in existing:
+                ex_source = ex.get("source", "")
+                if ex_source == "csv":
+                    continue  # only flag csv vs manual/bank conflicts
+                ex_d = dt.strptime(ex["date"], "%Y-%m-%d").date()
+                if abs((new_d - ex_d).days) > 2:
+                    continue
+                ex_amt = abs(ex["amount"])
+                if ex_amt == 0 or new_amt == 0:
+                    continue
+                diff_pct = abs(new_amt - ex_amt) / max(new_amt, ex_amt)
+                if diff_pct > 0.15:
+                    continue
+                ex_merchant = ex["merchant"].lower().strip()
+                if ex_merchant not in new_merchant and new_merchant not in ex_merchant:
+                    continue
+                conflicts.append({
+                    "existing": {
+                        "date": ex["date"],
+                        "amount": ex["amount"],
+                        "merchant": ex["merchant"],
+                        "source": ex_source,
+                    },
+                    "imported": {
+                        "date": new_r["date"],
+                        "amount": new_r["amount"],
+                        "merchant": new_r["merchant"],
+                        "source": "csv",
+                    },
+                    "amount_difference": round(abs(new_amt - ex_amt), 2),
+                    "date_difference_days": abs((new_d - ex_d).days),
+                })
+
+        for i in range(0, len(unique_records), 500):
+            db.table("transactions").insert(unique_records[i:i + 500]).execute()
+
+        records = unique_records
+
+    cache_invalidate(f"summary:{uid}")
+    background_tasks.add_task(recompute_analytics, uid)
 
     return {
-        "imported": imported,
+        "imported": len(records),
         "skipped": skipped,
+        "duplicates": duplicates,
+        "conflicts": conflicts[:10],
         "errors": errors[:10] if errors else [],
     }
 
@@ -213,17 +282,15 @@ async def import_csv(
 @router.delete("/{transaction_id}")
 def delete_transaction(
     transaction_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    t = db.query(models.Transaction).filter(
-        models.Transaction.id == transaction_id,
-        models.Transaction.user_id == current_user.id,
-    ).first()
-    if not t:
+    uid = str(current_user.id)
+    existing = db.table("transactions").select("id").eq("id", transaction_id).eq("user_id", uid).execute()
+    if not existing.data:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    db.delete(t)
-    db.commit()
+    db.table("transactions").delete().eq("id", transaction_id).eq("user_id", uid).execute()
+    cache_invalidate(f"summary:{uid}")
     return {"deleted": True}
 
 
@@ -231,25 +298,26 @@ def delete_transaction(
 def stats_by_category(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    query = db.query(
-        models.Transaction.category,
-        func.sum(models.Transaction.amount).label("total"),
-        func.count(models.Transaction.id).label("count"),
-    ).filter(
-        models.Transaction.user_id == current_user.id,
-        models.Transaction.amount < 0,
-    )
+    uid = str(current_user.id)
+    query = db.table("transactions").select("category,amount").eq("user_id", uid).lt("amount", 0)
     if start_date:
-        query = query.filter(models.Transaction.date >= date.fromisoformat(start_date))
+        query = query.gte("date", start_date)
     if end_date:
-        query = query.filter(models.Transaction.date <= date.fromisoformat(end_date))
+        query = query.lte("date", end_date)
 
-    rows = query.group_by(models.Transaction.category).all()
+    result = query.execute()
+
+    totals: dict = defaultdict(float)
+    counts: dict = defaultdict(int)
+    for t in result.data:
+        totals[t["category"]] += abs(t["amount"])
+        counts[t["category"]] += 1
+
     categories = sorted(
-        [{"category": r.category, "total": round(abs(r.total), 2), "count": r.count} for r in rows],
+        [{"category": cat, "total": round(total, 2), "count": counts[cat]} for cat, total in totals.items()],
         key=lambda x: x["total"],
         reverse=True,
     )

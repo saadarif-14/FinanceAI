@@ -6,6 +6,10 @@ const CATEGORIES = [
   "Subscriptions", "Healthcare", "Shopping", "Utilities", "Other",
 ];
 
+function pkr(amount, decimals = 0) {
+  return `Rs ${Number(amount).toLocaleString("en-PK", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
+}
+
 function BudgetCard({ budget, onDelete }) {
   const { category, budget: limit, spent, remaining, percent_used, period, status } = budget;
 
@@ -35,8 +39,8 @@ function BudgetCard({ budget, onDelete }) {
 
       <div className="mb-3">
         <div className="flex justify-between text-xs text-slate-400 mb-1.5">
-          <span>${spent.toFixed(0)} spent</span>
-          <span>${limit.toFixed(0)} {period}</span>
+          <span>{pkr(spent)} spent</span>
+          <span>{pkr(limit)} {period}</span>
         </div>
         <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
           <div
@@ -49,7 +53,7 @@ function BudgetCard({ budget, onDelete }) {
       <div className="flex justify-between text-xs">
         <span className="text-slate-500">{percent_used.toFixed(0)}% used</span>
         <span className={colors.text}>
-          {remaining >= 0 ? `$${remaining.toFixed(0)} left` : `$${Math.abs(remaining).toFixed(0)} over`}
+          {remaining >= 0 ? `${pkr(remaining)} left` : `${pkr(Math.abs(remaining))} over`}
         </span>
       </div>
     </div>
@@ -98,7 +102,7 @@ export default function BudgetsPage() {
   };
 
   return (
-    <div className="p-8 max-w-4xl mx-auto">
+    <div className="p-8 max-w-4xl mx-auto overflow-y-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-slate-100">Budgets</h1>
@@ -133,14 +137,14 @@ export default function BudgetsPage() {
               </select>
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1.5">Amount ($)</label>
+              <label className="block text-xs text-slate-400 mb-1.5">Amount (Rs)</label>
               <input
                 type="number"
                 min="1"
-                step="0.01"
+                step="1"
                 value={form.amount}
                 onChange={(e) => setForm({ ...form, amount: e.target.value })}
-                placeholder="500"
+                placeholder="50000"
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
             </div>
@@ -187,9 +191,8 @@ export default function BudgetsPage() {
         </div>
       )}
 
-      {/* Tip */}
       <div className="mt-6 bg-slate-900 border border-slate-800 rounded-xl p-4 text-sm text-slate-400">
-        💡 You can also set budgets via the AI Assistant — just say "Set a $300 monthly budget for Dining"
+        💡 You can also set budgets via the AI Assistant — just say "Set a Rs 30,000 monthly budget for Dining"
       </div>
     </div>
   );

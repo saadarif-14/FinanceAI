@@ -1,12 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import engine
-import models
-from routers import auth, transactions, chat, budgets, analytics
+from routers import auth, transactions, chat, budgets, analytics, bank
 
-models.Base.metadata.create_all(bind=engine)
-
-app = FastAPI(title="Personal Finance Assistant", version="1.0.0")
+app = FastAPI(title="Personal Finance Assistant", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +17,7 @@ app.include_router(transactions.router)
 app.include_router(chat.router)
 app.include_router(budgets.router)
 app.include_router(analytics.router)
+app.include_router(bank.router)
 
 
 @app.get("/health")

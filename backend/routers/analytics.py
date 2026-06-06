@@ -1,186 +1,167 @@
+from collections import defaultdict
 from datetime import date
 from fastapi import APIRouter, Depends, BackgroundTasks
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+from supabase import Client
 from database import get_db
-import models
 import auth_utils
 from services.analytics_service import recompute_analytics
+from limiter import cache_get, cache_set
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 @router.get("/subscriptions")
 def get_subscriptions(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    subs = db.query(models.Subscription).filter(models.Subscription.user_id == current_user.id).all()
+    uid = str(current_user.id)
+    result = db.table("subscriptions").select("*").eq("user_id", uid).execute()
+    subs = result.data
     freq_label = {7: "weekly", 14: "bi-weekly", 30: "monthly", 90: "quarterly", 365: "annual"}
     return {
         "subscriptions": [
             {
-                "merchant": s.merchant,
-                "amount": s.amount,
-                "frequency": freq_label.get(s.frequency_days, f"every {s.frequency_days} days"),
-                "last_seen": s.last_seen.isoformat() if s.last_seen else None,
-                "occurrence_count": s.occurrence_count,
-                "annual_cost": round(s.amount * (365 / s.frequency_days), 2),
+                "merchant": s["merchant"],
+                "amount": s["amount"],
+                "frequency": freq_label.get(s["frequency_days"], f"every {s['frequency_days']} days"),
+                "last_seen": s.get("last_seen"),
+                "occurrence_count": s.get("occurrence_count", 0),
+                "annual_cost": round(s["amount"] * (365 / s["frequency_days"]), 2),
             }
             for s in subs
         ],
-        "total_monthly": round(
-            sum(s.amount * (30 / s.frequency_days) for s in subs), 2
-        ),
+        "total_monthly": round(sum(s["amount"] * (30 / s["frequency_days"]) for s in subs), 2),
     }
 
 
 @router.get("/anomalies")
 def get_anomalies(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    anomalies = (
-        db.query(models.Anomaly)
-        .filter(models.Anomaly.user_id == current_user.id)
-        .order_by(models.Anomaly.amount.desc())
-        .all()
-    )
+    uid = str(current_user.id)
+    result = db.table("anomalies").select("*").eq("user_id", uid).order("amount", desc=True).execute()
     return {
         "anomalies": [
             {
-                "merchant": a.merchant,
-                "amount": a.amount,
-                "category": a.category,
-                "date": a.date.isoformat() if a.date else None,
-                "reason": a.reason,
-                "severity": a.severity,
+                "merchant": a.get("merchant"),
+                "amount": a.get("amount"),
+                "category": a.get("category"),
+                "date": a.get("date"),
+                "reason": a.get("reason"),
+                "severity": a.get("severity"),
             }
-            for a in anomalies
+            for a in result.data
         ]
     }
 
 
 @router.get("/summary")
 def get_summary(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    db: Client = Depends(get_db),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    """Full financial summary for the dashboard."""
+    uid = str(current_user.id)
+    cache_key = f"summary:{uid}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     today = date.today()
-    month_start = date(today.year, today.month, 1)
+    month_start = date(today.year, today.month, 1).isoformat()
+    today_str = today.isoformat()
 
-    # Current month spending by category
-    rows = (
-        db.query(
-            models.Transaction.category,
-            func.sum(models.Transaction.amount).label("total"),
-            func.count(models.Transaction.id).label("count"),
-        )
-        .filter(
-            models.Transaction.user_id == current_user.id,
-            models.Transaction.date >= month_start,
-            models.Transaction.date <= today,
-            models.Transaction.amount < 0,
-        )
-        .group_by(models.Transaction.category)
-        .all()
-    )
+    # Current month transactions
+    month_txns_res = db.table("transactions").select("category,amount,date,merchant") \
+        .eq("user_id", uid).gte("date", month_start).lte("date", today_str).execute()
+    month_txns = month_txns_res.data
+
+    # Split expenses vs income
+    expense_totals: dict = defaultdict(float)
+    expense_counts: dict = defaultdict(int)
+    total_income = 0.0
+
+    for t in month_txns:
+        if t["amount"] < 0:
+            expense_totals[t["category"]] += abs(t["amount"])
+            expense_counts[t["category"]] += 1
+        else:
+            total_income += t["amount"]
+
     categories = sorted(
-        [{"category": r.category, "total": round(abs(r.total), 2), "count": r.count} for r in rows],
+        [{"category": cat, "total": round(total, 2), "count": expense_counts[cat]}
+         for cat, total in expense_totals.items()],
         key=lambda x: x["total"],
         reverse=True,
     )
 
-    # Current month income
-    income = (
-        db.query(func.sum(models.Transaction.amount))
-        .filter(
-            models.Transaction.user_id == current_user.id,
-            models.Transaction.date >= month_start,
-            models.Transaction.date <= today,
-            models.Transaction.amount > 0,
-        )
-        .scalar()
-        or 0.0
-    )
+    # Total transaction count
+    total_txns_res = db.table("transactions").select("id", count="exact").eq("user_id", uid).execute()
+    total_txns = total_txns_res.count or 0
 
-    # Total transactions
-    total_txns = db.query(func.count(models.Transaction.id)).filter(
-        models.Transaction.user_id == current_user.id
-    ).scalar()
+    # Recent transactions (last 5)
+    recent_res = db.table("transactions").select("date,amount,merchant,category") \
+        .eq("user_id", uid).order("date", desc=True).limit(5).execute()
 
-    # Recent transactions
-    recent = (
-        db.query(models.Transaction)
-        .filter(models.Transaction.user_id == current_user.id)
-        .order_by(models.Transaction.date.desc())
-        .limit(5)
-        .all()
-    )
+    # Subscriptions
+    subs_res = db.table("subscriptions").select("amount,frequency_days").eq("user_id", uid).execute()
+    subs = subs_res.data
+    sub_monthly = sum(s["amount"] * (30 / s["frequency_days"]) for s in subs)
 
-    # Subscription count + monthly cost
-    subs = db.query(models.Subscription).filter(models.Subscription.user_id == current_user.id).all()
-    sub_monthly = sum(s.amount * (30 / s.frequency_days) for s in subs)
+    # Anomalies count
+    anomaly_res = db.table("anomalies").select("id", count="exact").eq("user_id", uid).execute()
+    anomaly_count = anomaly_res.count or 0
 
-    # Anomaly count
-    anomaly_count = db.query(func.count(models.Anomaly.id)).filter(
-        models.Anomaly.user_id == current_user.id
-    ).scalar()
-
-    # Budget status
-    budgets = db.query(models.Budget).filter(models.Budget.user_id == current_user.id).all()
+    # Budget alerts — single query for all category spending, no N+1
+    budgets_res = db.table("budgets").select("*").eq("user_id", uid).execute()
     over_budget = []
-    for b in budgets:
-        spent = (
-            db.query(func.sum(func.abs(models.Transaction.amount)))
-            .filter(
-                models.Transaction.user_id == current_user.id,
-                models.Transaction.category == b.category,
-                models.Transaction.date >= month_start,
-                models.Transaction.amount < 0,
-            )
-            .scalar()
-            or 0.0
+    if budgets_res.data:
+        budget_cats = [b["category"] for b in budgets_res.data]
+        # One query covering all budgeted categories for the month
+        budget_spent_res = (
+            db.table("transactions")
+            .select("category,amount")
+            .eq("user_id", uid)
+            .in_("category", budget_cats)
+            .gte("date", month_start)
+            .lte("date", today_str)
+            .lt("amount", 0)
+            .execute()
         )
-        if spent > b.amount * 0.85:
-            over_budget.append({
-                "category": b.category,
-                "budget": b.amount,
-                "spent": round(spent, 2),
-                "percent": round((spent / b.amount) * 100, 1),
-            })
+        cat_spent: dict = defaultdict(float)
+        for t in budget_spent_res.data:
+            cat_spent[t["category"]] += abs(t["amount"])
 
-    return {
+        for b in budgets_res.data:
+            spent = cat_spent.get(b["category"], 0.0)
+            if spent > b["amount"] * 0.85:
+                over_budget.append({
+                    "category": b["category"],
+                    "budget": b["amount"],
+                    "spent": round(spent, 2),
+                    "percent": round((spent / b["amount"]) * 100, 1),
+                })
+
+    payload = {
         "current_month": {
             "total_spending": round(sum(c["total"] for c in categories), 2),
-            "total_income": round(income, 2),
+            "total_income": round(total_income, 2),
             "categories": categories,
         },
-        "recent_transactions": [
-            {
-                "date": t.date.isoformat(),
-                "amount": t.amount,
-                "merchant": t.merchant,
-                "category": t.category,
-            }
-            for t in recent
-        ],
-        "subscriptions": {
-            "count": len(subs),
-            "monthly_cost": round(sub_monthly, 2),
-        },
+        "recent_transactions": recent_res.data,
+        "subscriptions": {"count": len(subs), "monthly_cost": round(sub_monthly, 2)},
         "anomalies": {"count": anomaly_count},
         "budget_alerts": over_budget,
         "total_transactions": total_txns,
     }
+    cache_set(cache_key, payload, ttl=60)
+    return payload
 
 
 @router.post("/recompute")
 def recompute(
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth_utils.get_current_user),
+    current_user=Depends(auth_utils.get_current_user),
 ):
-    background_tasks.add_task(recompute_analytics, current_user.id, db)
+    background_tasks.add_task(recompute_analytics, str(current_user.id))
     return {"status": "recomputing in background"}
