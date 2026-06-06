@@ -1,163 +1,232 @@
 # Personal Finance Assistant
 
-An AI-driven personal finance companion built for the Revonix Full Stack AI Engineer assessment.
-
-## Quick Start
-
-### 1. Backend
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Edit .env: add your ANTHROPIC_API_KEY and optionally a SECRET_KEY
-
-uvicorn main:app --reload
-# → http://localhost:8000
-```
-
-### 2. Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-# → http://localhost:5173
-```
-
-### 3. Load sample data
-
-Go to **Transactions → Import CSV** and upload `sample_data/transactions.csv` (250+ transactions, Jan–Jun 2025).
-
-Then ask the AI assistant anything:
-- "How much did I spend on groceries in April?"
-- "What are my recurring subscriptions?"
-- "Am I spending more this month than usual?"
-- Upload a receipt photo to record it automatically
+A full-stack AI-powered personal finance application built with **React + Vite** (frontend) and **FastAPI** (backend), using **Supabase** for auth and data storage, **OpenAI GPT-4o-mini** for the AI assistant, and **Redis** for caching and rate limiting.
 
 ---
 
-## Architecture
+## Features Covered
 
-### Stack
+### 1. Authentication
+- JWT-based register and login via Supabase Auth
+- Refresh token flow — access tokens auto-refresh silently on 401; users stay logged in until they explicitly log out
+- Refresh token stored in `localStorage`; concurrent refresh calls deduplicated with a shared Promise
 
-| Layer | Tech | Why |
-|---|---|---|
-| Frontend | React + Vite + Tailwind v4 | Fast dev, known stack |
-| Backend | FastAPI + SQLite (SQLAlchemy) | Async, easy to run locally, swap to Postgres for prod |
-| Auth | JWT (python-jose + bcrypt) | Stateless, no external service needed |
-| AI | Anthropic Claude API | Tool use, vision, best reasoning |
+### 2. Transaction Management
+- Manual transaction entry (date, amount, merchant, category)
+- CSV import with robust parsing:
+  - Fuzzy column detection — recognises `merchant`, `payee`, `description`, `vendor`, etc.
+  - Multiple date format support: `YYYY-MM-DD`, `MM/DD/YYYY`, `DD/MM/YYYY`, `MM-DD-YYYY`, `YYYY/MM/DD`
+  - Strips `Rs`, `$`, commas, and parenthetical negatives from amounts
+  - Skips zero-amount rows, blank merchants, and unparseable dates
+  - Reports `imported`, `skipped`, and `duplicates` counts to the user
+- **Duplicate detection** — builds a `(date, amount, merchant_lower)` fingerprint set from existing transactions in the same date range; skips exact matches and prevents within-batch duplicates
+- **Conflict detection** — flags rows that appear to be the same purchase from two different sources (same merchant substring, within ±2 days, within ±15% amount, different `source` field); shown as a warning in the UI
+- Delete transactions with immediate cache invalidation
+- Category filter and pagination
 
-### The Core AI Design
+### 3. Budget Management
+- Create, view, and delete budgets per category (monthly or weekly)
+- Real-time spending vs budget displayed as progress bars
+- Coloured portion = amount spent; dark track = remaining budget
+- Dashboard alerts when spending exceeds 85% of the limit
 
-**Tool-based architecture** — Claude never sees raw transaction dumps. Instead it gets a set of DB-backed tools:
+### 4. Analytics Engine
+- **Subscription detection** — groups transactions by merchant; requires amount consistency (±15%) and interval regularity (±25% of standard periods: 7/14/30/90/365 days); results stored in `subscriptions` table
+- **Anomaly detection** — Z-score analysis (≥2.0 = medium, ≥3.0 = high) against 90-day historical baseline per category; results stored in `anomalies` table
+- Both run as background tasks after every CSV import — pre-computed results mean dashboard reads are O(1) regardless of transaction volume
 
-```
-get_user_context()        → stored user preferences
-get_spending_summary()    → pre-aggregated category totals (fast)
-get_transactions()        → filtered raw rows, max 50 per call
-get_monthly_trend()       → month-by-month spending trend
-get_subscriptions()       → pre-computed recurring charges
-get_anomalies()           → pre-computed statistical outliers
-get_budgets()             → budgets with current spending
-set_budget()              → create/update a budget
-remember_user_fact()      → persist user context across sessions
-lookup_merchant()         → DuckDuckGo search for unknown merchants
-```
+### 5. AI Financial Assistant
+- Powered by **GPT-4o-mini** with native tool calling
+- **Streaming responses via SSE** — user sees the first token within ~1 second of tool execution completing
+- Auto-generated conversation titles (3–6 words) via GPT-4o-mini on first message
+- Tool suite:
 
-Why this matters for scale: a user with 5 years of transactions (~3,000+ rows) never sends those to the model. A "how much did I spend on groceries last month?" query becomes one SQL aggregate call returning a single number, then Claude formats the answer. The model context stays small; costs stay low.
-
-**Conversation history** is capped at 40 messages in the DB. This bounds token costs regardless of how long users chat.
-
-### Routing & Model Selection
-
-Currently uses `claude-sonnet-4-6` for all queries with tool use. The architectural decision was:
-
-1. **Tool use replaces routing**: Rather than a separate haiku classification pass, the tool definitions themselves encode what data to fetch. Claude picks the right tool automatically.
-2. **Cost comes from tool results, not model choice**: Pre-computed aggregates (subscriptions, anomalies, monthly totals) are computed once on CSV import, not per-request. This is the real cost lever.
-3. **Production improvement**: Add a haiku routing layer for queries that can be answered without tools (e.g. "what categories do you track?") to avoid unnecessary sonnet invocations.
-
-### Analytics Pipeline
-
-Runs in background after CSV import:
-
-**Subscription detection**: Groups transactions by merchant → checks amount consistency (±15%) → checks interval regularity against [7, 14, 30, 90, 365] day patterns (±25% tolerance). Stored in DB for O(1) retrieval.
-
-**Anomaly detection**: Builds per-category baseline (mean + std dev) from historical data (>90 days old) → flags recent transactions with z-score ≥ 2.0. Severity: high if z ≥ 3.0.
-
-**Receipt parsing**: Passes image to Claude with vision. Handles blurry/rotated/partial images gracefully — Claude's vision is robust to poor quality. Foreign language receipts work because claude-sonnet-4-6 is multilingual.
-
-### Data Resilience
-
-CSV import handles:
-- Multiple date formats (YYYY-MM-DD, MM/DD/YYYY, DD/MM/YYYY, etc.)
-- Currency symbols and parenthetical negatives: `$45.00`, `(45.00)`, `45,00`
-- Flexible column naming (merchant/payee/description/vendor all detected)
-- Missing categories (auto-assigned from merchant name)
-- Junk/empty rows (skipped with count)
-- Duplicate imports (no dedup currently — assumption: users import once; production would add a hash-based dedup)
-
-### Scale Considerations
-
-| Constraint | Approach |
+| Tool | Purpose |
 |---|---|
-| Fast responses | Pre-computed analytics; SQL aggregates over AI scans |
-| Low cost per query | Tools return aggregates, not rows; 40-message history cap |
-| Large data | Tool results are bounded (max 50 rows); aggregates are O(1) |
-| Many users | Stateless JWT; SQLite swaps to Postgres + connection pool |
-| Growing history | Anomaly baseline uses 90-day window; trend uses 6-month window |
+| `get_user_context` | Load persisted user preferences (always called first) |
+| `remember_user_fact` | Save preferences across sessions (pay day, exclusions, goals) |
+| `create_transaction` | Save a transaction from chat or confirmed receipt |
+| `get_spending_summary` | Aggregate spend by category for a date range |
+| `get_transactions` | Filtered transaction lookup (capped at 50) |
+| `get_monthly_trend` | Month-by-month spending for trend analysis |
+| `get_subscriptions` | List detected recurring charges with annual cost |
+| `get_anomalies` | Surface statistically unusual transactions |
+| `get_budgets` | Budget vs actual with status (ok / warning / over) |
+| `set_budget` | Create or update a budget from chat |
+| `lookup_merchant` | DuckDuckGo web lookup for unknown merchant names |
+| `get_conflicts` | Detect contradicting records across sources |
 
-### What Was Skipped / Simplified
+- Receipt image analysis — flags unreadable fields with `(?)` rather than guessing; never invents an amount it cannot read
+- Cross-session memory via `user_context` table (key-value per user)
+- Chat history trimmed to 40 messages to bound token cost
+- Tool loop capped at 6 iterations
 
-- **Real bank integration**: Replaced with CSV import + mock data. Production: Plaid/MX.
-- **Streaming responses**: Chat is request/response. Production: SSE for faster perceived latency.
-- **haiku routing layer**: Would reduce cost ~30% for simple queries. Architecture supports it — just add a classify() call before the main tool loop.
-- **Duplicate transaction detection**: Hash-based dedup would prevent reimporting the same CSV.
-- **Real-time web search**: Using DuckDuckGo instant answers. Production: Brave Search API or Tavily for richer merchant data.
-- **Push notifications**: Budget alerts shown on dashboard; production would add email/push.
-- **Multi-currency**: Assumes USD. Architecture supports it — add currency field to Transaction model.
+### 6. Dashboard
+- Monthly spending, income, and net balance
+- Spending by category with budget-aware progress bars
+- Recent transactions, subscription monthly cost, anomaly count, budget alerts
 
-### Assumptions
+### 7. Performance & Reliability
 
-- Negative amounts = expenses, positive = income (standard bank export convention)
-- One conversation thread per user (sufficient for the use case; production might add threads)
-- SQLite for local dev; designed to drop-in replace with PostgreSQL (just change DATABASE_URL)
-- Users import their own CSV; no live bank connection in this version
+**Two-layer caching:**
 
-## API Reference
+| Endpoint | Client TTL | Server TTL |
+|---|---|---|
+| `getSummary` | 30s | 60s (Redis) |
+| `getBudgets` | 30s | — |
+| `getTransactions` | 30s per params key | — |
+| `listConversations` | 15s | — |
+| `getBankAccounts` | 5 min | — |
+
+Every write operation explicitly deletes affected cache keys — TTLs are a safety net, not the primary freshness mechanism.
+
+**Rate limiting:** AI endpoint limited to 30 requests per 60-second sliding window per user using a Redis sorted-set. Falls back to in-memory if Redis is unavailable.
+
+**Other:** Fresh Supabase client per request eliminates stale HTTP/2 connection errors. N+1 budget query replaced with a single `IN` query.
+
+---
+
+## Key Architectural Decisions
+
+### GPT-4o-mini for all turns
+Handles tool calling and finance Q&A well at ~15× lower cost than GPT-4o. Title generation also uses mini.
+
+### Tool-based AI over raw data dumps
+The AI never receives a raw transaction dump. Every data access goes through a tool running a bounded DB query. A user with five years of transactions asking "how much did I spend on groceries last month?" results in one SQL aggregate call — not thousands of rows sent to the model.
+
+### Streaming SSE for perceived speed
+Tool call deltas are accumulated per index in a `tool_calls_map` dict, executed synchronously, then the final answer is streamed token by token to the frontend via `text/event-stream`. Content appears as it is generated rather than after the full response completes.
+
+### Pre-computed analytics
+Subscription and anomaly detection run once as background tasks after each import and are stored in dedicated tables. Dashboard reads are constant time regardless of how many transactions exist.
+
+### Two-layer cache with explicit invalidation
+Every write explicitly deletes affected cache keys on both client and server. This means: add a transaction → summary cache cleared immediately → next dashboard load is always fresh.
+
+### Fresh Supabase client per request
+Supabase closes idle HTTP/2 connections. A singleton held the dead connection and reused it, causing `Server disconnected` errors. A fresh client per request avoids this entirely. `create_client()` is lightweight and opens no connections eagerly.
+
+---
+
+## Assumptions & Trade-offs
+
+| Decision | Trade-off |
+|---|---|
+| GPT-4o-mini for all turns | Trades occasional reasoning depth for 15× cost reduction |
+| Fresh Supabase client per request | Eliminates stale connection errors at negligible overhead |
+| In-process fallback when Redis is down | Single-process correctness only; app stays functional without Redis |
+| Client cache TTL of 30s | Explicit write-invalidation prevents stale reads; TTL is a safety net |
+| Subscription detection requires ≥2 occurrences | Avoids false positives; may miss cancelled-after-one-charge subscriptions |
+| Anomaly detection requires ≥3 historical transactions | Z-score meaningless with fewer data points; sparse categories silently skipped |
+| PKR only | System prompt, keywords, and amount thresholds tuned for Pakistani Rupees |
+| Conflict detection uses substring match | Catches "KFC" vs "KFC Gulberg"; may false-positive on merchants sharing a common word |
+
+---
+
+## What Was Intentionally Skipped or Simplified
+
+- **Multi-worker cache invalidation** — client-side cache is per-browser-tab; Redis invalidation works across workers, in-memory fallback does not
+- **AI tool result pagination** — `get_transactions` capped at 50; AI sees only the most recent 50 for large filtered sets
+- **Real bank integration** — mock data only; production would require Plaid/Teller OAuth
+- **Push notifications** — anomalies and budget breaches shown on dashboard only; no email or push
+- **Redis authentication** — `requirepass` disabled for local dev; must be enabled for production
+- **Automated test suite** — no unit or integration tests; all verification was manual
+- **Multi-currency support** — hardcoded to PKR; requires preference storage and system prompt threading
+
+---
+
+## Challenges & How They Were Handled
+
+**`httpx.RemoteProtocolError: Server disconnected`**
+Supabase closes idle HTTP/2 connections. The singleton client reused dead connections on the next request. Fixed by removing the singleton — fresh client per request.
+
+**Streaming with tool call deltas**
+OpenAI sends tool call data fragmented across chunks: `id` only in the first chunk, `function.name` and `function.arguments` accumulating across subsequent chunks. Solved by accumulating per tool call index in a `tool_calls_map` dict before executing. Content tokens are yielded directly to the SSE response; tool execution rounds yield nothing.
+
+**Spending bar showing 100% when no budget set**
+Top category always appeared full because it was used as the 100% denominator. Fixed: if a budget exists use `spent/budget`; if not use `spent/totalSpend` for a proportional view.
+
+**N+1 query on dashboard summary**
+One DB query per budget category to calculate current-month spending. Replaced with a single `.in_("category", budget_cats)` query and Python-side aggregation.
+
+**Duplicate detection across re-imports**
+Fingerprint set built from existing transactions before inserting. Each accepted row also added to the set to prevent within-batch duplicates.
+
+**Conflict detection false positives**
+Tightened to: merchant must be a substring of the other (not word overlap), amount within ±15%, date within ±2 days, sources must differ. Only flags CSV-vs-manual or CSV-vs-bank to avoid noise from split transactions.
+
+---
+
+## Local Setup
+
+### Prerequisites
+- Python 3.10+, Node.js 18+, Redis, Supabase project, OpenAI API key
+
+### Backend
+```bash
+cd backend
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+# .env needs: SUPABASE_URL, SUPABASE_SERVICE_KEY, OPENAI_API_KEY, REDIS_URL
+uvicorn main:app --reload --port 8080
+```
+
+### Frontend
+```bash
+cd frontend
+npm install
+npm run dev   # → http://localhost:5173
+```
+
+### Redis
+```bash
+sudo systemctl start redis-server
+redis-cli ping   # → PONG
+```
+
+### Docker (full stack)
+```bash
+cd backend
+docker-compose up -d
+```
+
+---
+
+## Project Structure
 
 ```
-POST /auth/register        { email, password }
-POST /auth/login           { email, password }
-GET  /auth/me
-
-GET  /transactions         ?category=&start_date=&end_date=&limit=&offset=
-POST /transactions          { date, amount, merchant, category, description }
-POST /transactions/import  multipart/form-data file=<csv>
-DELETE /transactions/{id}
-GET  /transactions/stats/categories
-
-POST /chat                 { message, image_data?, image_type? }
-GET  /chat/history
-DELETE /chat/history
-
-GET  /budgets
-POST /budgets              { category, amount, period }
-DELETE /budgets/{id}
-
-GET  /analytics/summary
-GET  /analytics/subscriptions
-GET  /analytics/anomalies
-POST /analytics/recompute
+task-home/
+├── backend/
+│   ├── main.py                     # FastAPI app, CORS, routers
+│   ├── database.py                 # Fresh Supabase client per request
+│   ├── auth_utils.py               # JWT verification via Supabase
+│   ├── limiter.py                  # Redis rate limiter + TTL cache with in-memory fallback
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   ├── redis/
+│   │   ├── Dockerfile
+│   │   └── redis.conf              # 128 MB maxmemory, LRU eviction, RDB persistence
+│   ├── routers/
+│   │   ├── auth.py                 # Register, login, refresh token
+│   │   ├── transactions.py         # CRUD, CSV import, duplicate + conflict detection
+│   │   ├── budgets.py              # Budget CRUD
+│   │   ├── analytics.py            # Summary (Redis-cached), subscriptions, anomalies
+│   │   ├── chat.py                 # Conversation CRUD, streaming SSE endpoint
+│   │   └── bank.py                 # Mock bank sync
+│   └── services/
+│       ├── ai_service.py           # GPT-4o-mini streaming tool loop, title generation
+│       ├── finance_tools.py        # All AI tool definitions and handlers
+│       └── analytics_service.py    # Subscription + anomaly detection algorithms
+└── frontend/
+    └── src/
+        ├── api.js                  # All API calls, client-side cache, token refresh
+        ├── App.jsx                 # Router, protected layout, ambient blobs
+        ├── context/AuthContext.jsx
+        ├── components/Sidebar.jsx
+        └── pages/
+            ├── DashboardPage.jsx
+            ├── ChatPage.jsx        # SSE streaming consumer, mobile-responsive
+            ├── TransactionsPage.jsx
+            └── BudgetsPage.jsx
 ```
-
-## Challenges
-
-**Conversation serialization**: Anthropic's SDK returns typed objects (TextBlock, ToolUseBlock) that aren't directly JSON-serializable for DB storage. Solved by normalizing to plain dicts before persistence and reconstructing on load.
-
-**Subscription detection false positives**: Initial algorithm flagged any repeated charge as a subscription. Fixed by requiring both amount consistency AND interval regularity against standard periods, with tolerance bounds.
-
-**Tool loop termination**: Added a max-iterations guard (6) to prevent runaway tool loops on edge cases where Claude keeps calling tools without reaching a conclusion.
